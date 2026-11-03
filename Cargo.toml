@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = [
+    "protocol",
+    "client",
+    "server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+protocol = { path = "protocol" }
