@@ -4,4 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-protocol = { version = "0.1.0", path = "../protocol" }
+anyhow.workspace = true
+cpal = "0.18.2"
+protocol = { path = "../protocol", version = "0.1.0" }
+rtrb = "0.4.1"

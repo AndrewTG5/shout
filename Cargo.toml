@@ -11,4 +11,12 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+anyhow = "1.0.104"
 protocol = { path = "protocol" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"            # Enables cross-crate link-time optimization
+codegen-units = 1      # Allows better vectorization across the whole binary
+panic = "abort"        # Removes unwinding overhead and reduces binary size
+strip = true           # Strips symbols and debug info

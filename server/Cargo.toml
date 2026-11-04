@@ -4,4 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-protocol = { version = "0.1.0", path = "../protocol" }
+anyhow.workspace = true
+nnnoiseless = "0.5.2"
+protocol = { path = "../protocol", version = "0.1.0" }
