@@ -2,14 +2,20 @@
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig, SupportedStreamConfigRange};
+use cpal::{
+    BufferSize, SampleFormat, StreamConfig, SupportedBufferSize, SupportedStreamConfigRange,
+};
 use protocol::{
     FRAME_SAMPLES, PACKET_BYTES, SAMPLE_RATE, SERVER_BIND_ADDR, decode_frame, encode_frame,
 };
 use rtrb::RingBuffer;
 use std::net::UdpSocket;
 use std::thread;
-use std::time::Duration;
+
+/// Target hardware callback size: 240 frames = 5ms at 48kHz.
+const TARGET_BUFFER_FRAMES: u32 = 240;
+/// Ring buffer capacity: 2 network frames = 960 samples (20ms).
+const RING_BUFFER_SAMPLES: usize = FRAME_SAMPLES * 2;
 
 fn main() -> Result<()> {
     let host = cpal::default_host();
@@ -40,16 +46,17 @@ fn main() -> Result<()> {
     let in_channels = in_cfg.channels as usize;
     let out_channels = out_cfg.channels as usize;
 
-    let (mut capture_producer, mut capture_consumer) =
-        RingBuffer::<i16>::new((SAMPLE_RATE as usize) / 10);
+    let (mut capture_producer, mut capture_consumer) = RingBuffer::<i16>::new(RING_BUFFER_SAMPLES);
     let (mut playback_producer, mut playback_consumer) =
-        RingBuffer::<i16>::new((SAMPLE_RATE as usize) / 20);
+        RingBuffer::<i16>::new(RING_BUFFER_SAMPLES);
 
     let socket = UdpSocket::bind("0.0.0.0:0").context("Failed to bind UDP socket")?;
     socket
         .connect(SERVER_BIND_ADDR)
         .context("Failed to connect UDP socket")?;
     let rx_socket = socket.try_clone().context("Failed to clone UDP socket")?;
+
+    let tx_thread = thread::current();
 
     let _input_stream = input_device
         .build_input_stream(
@@ -60,6 +67,9 @@ fn main() -> Result<()> {
                     let mono = frame.iter().copied().sum::<f32>() * inv_channels;
                     let sample_i16 = (mono.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                     let _ = capture_producer.push(sample_i16);
+                }
+                if capture_producer.slots() <= RING_BUFFER_SAMPLES - FRAME_SAMPLES {
+                    tx_thread.unpark();
                 }
             },
             |_| {},
@@ -84,12 +94,8 @@ fn main() -> Result<()> {
         )
         .context("Failed to build output stream")?;
 
-    _input_stream
-        .play()
-        .context("Failed to start input stream")?;
-    _output_stream
-        .play()
-        .context("Failed to start output stream")?;
+    _input_stream.play().context("Failed to start input stream")?;
+    _output_stream.play().context("Failed to start output stream")?;
 
     thread::spawn(move || {
         let mut recv_buf = [0u8; PACKET_BYTES];
@@ -113,7 +119,7 @@ fn main() -> Result<()> {
     let mut packet = [0u8; PACKET_BYTES];
 
     loop {
-        if let Ok(chunk) = capture_consumer.read_chunk(FRAME_SAMPLES) {
+        while let Ok(chunk) = capture_consumer.read_chunk(FRAME_SAMPLES) {
             let (first, second) = chunk.as_slices();
             pcm_frame[..first.len()].copy_from_slice(first);
             pcm_frame[first.len()..].copy_from_slice(second);
@@ -121,9 +127,8 @@ fn main() -> Result<()> {
 
             encode_frame(&pcm_frame, &mut packet);
             let _ = socket.send(&packet);
-        } else {
-            thread::sleep(Duration::from_millis(1));
         }
+        thread::park();
     }
 }
 
@@ -138,5 +143,15 @@ fn select_f32_48k_config(
                 && SAMPLE_RATE <= r.max_sample_rate()
         })
         .min_by_key(|r| r.channels().abs_diff(preferred_channels))
-        .map(|r| r.with_sample_rate(SAMPLE_RATE).into())
+        .map(|r| {
+            let buffer_size = match r.buffer_size() {
+                SupportedBufferSize::Range { min, max } => {
+                    BufferSize::Fixed(TARGET_BUFFER_FRAMES.clamp(*min, *max))
+                }
+                SupportedBufferSize::Unknown => BufferSize::Default,
+            };
+            let mut cfg: StreamConfig = r.with_sample_rate(SAMPLE_RATE).into();
+            cfg.buffer_size = buffer_size;
+            cfg
+        })
 }

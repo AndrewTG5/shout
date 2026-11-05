@@ -13,8 +13,8 @@ const TICK_INTERVAL: Duration = Duration::from_millis(10);
 const VAD_THRESHOLD: f32 = 0.6;
 /// 30 frames * 10ms = 300ms hangover after voice activity drops below threshold.
 const VAD_HANGOVER_FRAMES: u32 = 30;
-/// Maximum queued 10ms frames per client (20ms max server-side jitter buffer).
-const MAX_QUEUED_FRAMES: usize = 2;
+/// Maximum queued 10ms frames per client for >2 client rooms (10ms max server-side queue).
+const MAX_QUEUED_FRAMES: usize = 1;
 
 struct ClientState {
     denoiser: Box<DenoiseState<'static>>,
@@ -34,8 +34,12 @@ impl ClientState {
     }
 
     /// Runs `nnnoiseless` on an incoming 10ms frame (scaled in `[-32768.0, 32767.0]`)
-    /// and pushes the denoised frame into `active_frames` if the VAD + hangover gate is open.
-    fn process_incoming_pcm(&mut self, pcm: &[i16; FRAME_SAMPLES], now: Instant) {
+    /// and returns `Some(denoised)` if the VAD + hangover gate is open.
+    fn denoise_and_gate(
+        &mut self,
+        pcm: &[i16; FRAME_SAMPLES],
+        now: Instant,
+    ) -> Option<[f32; FRAME_SAMPLES]> {
         self.last_seen = now;
 
         let mut input_f32 = [0.0f32; FRAME_SAMPLES];
@@ -47,7 +51,9 @@ impl ClientState {
         let vad_prob = self.denoiser.process_frame(&mut denoised, &input_f32);
 
         if self.update_vad_gate(vad_prob) {
-            self.push_active_frame(denoised);
+            Some(denoised)
+        } else {
+            None
         }
     }
 
@@ -69,6 +75,14 @@ impl ClientState {
         }
         self.active_frames.push_back(frame);
     }
+}
+
+fn encode_f32_frame(frame: &[f32; FRAME_SAMPLES], out_packet: &mut [u8; PACKET_BYTES]) {
+    let mut pcm_i16 = [0i16; FRAME_SAMPLES];
+    for (dst, &s) in pcm_i16.iter_mut().zip(frame.iter()) {
+        *dst = s.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    }
+    encode_frame(&pcm_i16, out_packet);
 }
 
 /// Computes `N-1` mixed frames for all connected `recipients` given the set of `active_speakers`
@@ -104,25 +118,19 @@ fn compute_n_minus_1_packets(
             continue;
         }
 
-        let mut mixed_i16 = [0i16; FRAME_SAMPLES];
+        let mut packet = [0u8; PACKET_BYTES];
         if let Some(own) = self_frame {
-            for ((dst, &tot), &self_s) in mixed_i16
-                .iter_mut()
-                .zip(total_mix.iter())
-                .zip(own.iter())
+            let mut mixed_i16 = [0i16; FRAME_SAMPLES];
+            for ((dst, &tot), &self_s) in mixed_i16.iter_mut().zip(total_mix.iter()).zip(own.iter())
             {
                 let sample = (tot - self_s).clamp(i16::MIN as f32, i16::MAX as f32);
                 *dst = sample as i16;
             }
+            encode_frame(&mixed_i16, &mut packet);
         } else {
-            for (dst, &tot) in mixed_i16.iter_mut().zip(total_mix.iter()) {
-                let sample = tot.clamp(i16::MIN as f32, i16::MAX as f32);
-                *dst = sample as i16;
-            }
+            encode_f32_frame(&total_mix, &mut packet);
         }
 
-        let mut packet = [0u8; PACKET_BYTES];
-        encode_frame(&mixed_i16, &mut packet);
         out_packets.push((recipient, packet));
     }
 
@@ -134,13 +142,13 @@ fn main() -> Result<()> {
         .with_context(|| format!("Failed to bind UDP socket on {SERVER_BIND_ADDR}"))?;
 
     println!(
-        "=== Shout VOIP Server listening on {} ({} Hz, {} samples/frame) ===",
-        SERVER_BIND_ADDR, SAMPLE_RATE, FRAME_SAMPLES
+        "=== Shout VOIP Server listening on {SERVER_BIND_ADDR} ({SAMPLE_RATE} Hz, {FRAME_SAMPLES} samples/frame) ==="
     );
 
     let mut clients: HashMap<SocketAddr, ClientState> = HashMap::new();
     let mut recv_buf = [0u8; 2048];
     let mut decoded_pcm = [0i16; FRAME_SAMPLES];
+    let mut direct_packet = [0u8; PACKET_BYTES];
     let mut next_tick = Instant::now() + TICK_INTERVAL;
 
     loop {
@@ -153,16 +161,29 @@ fn main() -> Result<()> {
             match socket.recv_from(&mut recv_buf) {
                 Ok((len, peer)) => {
                     if len == PACKET_BYTES {
-                        let pkt: &[u8; PACKET_BYTES] =
-                            recv_buf[..PACKET_BYTES].try_into().unwrap();
+                        let pkt: &[u8; PACKET_BYTES] = recv_buf[..PACKET_BYTES].try_into().unwrap();
                         decode_frame(pkt, &mut decoded_pcm);
 
                         let rx_time = Instant::now();
-                        let client = clients.entry(peer).or_insert_with(|| {
+                        clients.entry(peer).or_insert_with(|| {
                             println!("[+] Client connected: {peer}");
                             ClientState::new(rx_time)
                         });
-                        client.process_incoming_pcm(&decoded_pcm, rx_time);
+
+                        let num_clients = clients.len();
+                        let other_peer = (num_clients == 2)
+                            .then(|| clients.keys().find(|&&addr| addr != peer).copied())
+                            .flatten();
+
+                        let client = clients.get_mut(&peer).unwrap();
+                        if let Some(denoised) = client.denoise_and_gate(&decoded_pcm, rx_time) {
+                            if let Some(_) = other_peer {
+                                // Fast path for 2 clients: immediate zero-tick forwarding
+                                encode_f32_frame(&denoised, &mut direct_packet);
+                            } else if num_clients > 2 {
+                                client.push_active_frame(denoised);
+                            }
+                        }
                     }
                 }
                 Err(err)
@@ -192,23 +213,28 @@ fn main() -> Result<()> {
                 alive
             });
 
-            // 2. Collect one active frame per speaking client for this 10ms tick
-            let mut active_speakers: HashMap<SocketAddr, [f32; FRAME_SAMPLES]> =
-                HashMap::with_capacity(clients.len());
-            for (&addr, state) in clients.iter_mut() {
-                if let Some(frame) = state.active_frames.pop_front() {
-                    active_speakers.insert(addr, frame);
-                }
-            }
-
-            // 3. Mix N-1 audio and send to each recipient
-            if !active_speakers.is_empty() && clients.len() > 1 {
-                let recipients: Vec<SocketAddr> = clients.keys().copied().collect();
-                let packets = compute_n_minus_1_packets(&recipients, &active_speakers);
-                for (recipient, packet) in packets {
-                    if let Err(err) = socket.send_to(&packet, recipient) {
-                        eprintln!("Failed to send audio packet to {recipient}: {err}");
+            // 2. Mix N-1 audio on the 10ms tick only when > 2 clients are connected
+            if clients.len() > 2 {
+                let mut active_speakers: HashMap<SocketAddr, [f32; FRAME_SAMPLES]> =
+                    HashMap::with_capacity(clients.len());
+                for (&addr, state) in clients.iter_mut() {
+                    if let Some(frame) = state.active_frames.pop_front() {
+                        active_speakers.insert(addr, frame);
                     }
+                }
+
+                if !active_speakers.is_empty() {
+                    let recipients: Vec<SocketAddr> = clients.keys().copied().collect();
+                    let packets = compute_n_minus_1_packets(&recipients, &active_speakers);
+                    for (recipient, packet) in packets {
+                        if let Err(err) = socket.send_to(&packet, recipient) {
+                            eprintln!("Failed to send audio packet to {recipient}: {err}");
+                        }
+                    }
+                }
+            } else {
+                for state in clients.values_mut() {
+                    state.active_frames.clear();
                 }
             }
         }
@@ -257,8 +283,10 @@ mod tests {
             client.push_active_frame([i as f32; FRAME_SAMPLES]);
         }
         assert_eq!(client.active_frames.len(), MAX_QUEUED_FRAMES);
-        // First 2 frames (1.0 and 2.0) should have been dropped; oldest is now 3.0
-        assert_eq!(client.active_frames.front().unwrap()[0], 3.0);
+        assert_eq!(
+            client.active_frames.front().unwrap()[0],
+            (MAX_QUEUED_FRAMES + 2) as f32
+        );
     }
 
     #[test]
